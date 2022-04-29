@@ -4,6 +4,7 @@ go 1.18
 
 require (
 	github.com/filecoin-project/go-address v0.0.6
+	github.com/filecoin-project/go-state-types v0.1.3
 	github.com/ipfs/go-cid v0.2.0
 	github.com/libp2p/go-libp2p-core v0.15.1
 	github.com/multiformats/go-multiaddr v0.5.0
