@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,10 +14,20 @@ import (
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/big"
 	"github.com/ipfs/go-cid"
+	"github.com/ipfs/go-datastore"
+	leveldb "github.com/ipfs/go-ds-leveldb"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/multiformats/go-multiaddr"
 	jrpc "github.com/ybbus/jsonrpc/v2"
 )
+
+type SPInfo struct {
+	PeerID       peer.ID
+	SPID         string
+	Price        float64
+	MinPieceSize int
+	MaxPieceSize int
+}
 
 type ExpTipSet struct {
 	Cids []cid.Cid
@@ -47,6 +58,7 @@ type MarketBalance struct {
 
 const defaultGateway = "api.node.glif.io"
 const maxRoutines = 20
+const dataStorePath = "datastore"
 
 func main() {
 	// Subcommands
@@ -196,23 +208,32 @@ func minerInfoToAddrInfo(minerInfo MinerInfo) (peer.AddrInfo, error) {
 	}, nil
 }
 
-func minerListToPeerId(minerList map[string]MarketBalance, jrpcClient jrpc.RPCClient) (map[string]peer.ID, error) {
-	minerIdToPeerId := make(map[string]peer.ID)
+func minerListToPeerId(minerList map[string]MarketBalance, jrpcClient jrpc.RPCClient) (map[peer.ID]SPInfo, error) {
+	minerIdToPeerId := make(map[peer.ID]SPInfo)
 	minerChan := make(chan string)
-	resultChan := make(chan string)
+	resultChan := make(chan SPInfo)
 	var wg sync.WaitGroup
 	wg.Add(maxRoutines)
 	for i := 0; i < maxRoutines; i++ {
 		go func() {
 			for minerId := range minerChan {
-				resultChan <- printMinerIdPeerId(minerId, jrpcClient)
+				peerID, err := printMinerIdPeerId(minerId, jrpcClient)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					continue
+				}
+
+				resultChan <- SPInfo{
+					PeerID: peerID,
+					SPID:   minerId,
+				}
 			}
 			wg.Done()
 		}()
 	}
 	go func() {
-		for out := range resultChan {
-			fmt.Print(out)
+		for spinfo := range resultChan {
+			minerIdToPeerId[spinfo.PeerID] = spinfo
 		}
 	}()
 	for k := range minerList {
@@ -254,17 +275,17 @@ func minerListToQueryAsks(minerList map[string]MarketBalance, jrpcClient jrpc.RP
 	return minerIdToQueryAsks, nil
 }
 
-func printMinerIdPeerId(minerId string, jrpcClient jrpc.RPCClient) string {
+func printMinerIdPeerId(minerId string, jrpcClient jrpc.RPCClient) (peer.ID, error) {
 	var minerInfo MinerInfo
 	err := jrpcClient.CallFor(&minerInfo, "Filecoin.StateMinerInfo", minerId, nil)
 
 	if err != nil {
-		return fmt.Sprintln(minerId, err)
+		return peer.ID(""), err
 	}
 	if minerInfo.PeerId == nil {
-		return fmt.Sprintln(minerId, "has no peer ID")
+		return peer.ID(""), fmt.Errorf("storage provide %q has no peer ID", minerId)
 	}
-	return fmt.Sprintln(minerId, " -> ", *minerInfo.PeerId)
+	return *minerInfo.PeerId, nil
 }
 
 func printMinerQueryAskResult(minerId string, jrpcClient jrpc.RPCClient) string {
@@ -306,9 +327,37 @@ func populateMinerPeerIds(gateway string) error {
 	}
 
 	mIdPeerIdMap, err := minerListToPeerId(minerList, jrpcClient)
+	if err != nil {
+		return err
+	}
+
+	err = os.MkdirAll(dataStorePath, 0750)
+	if err != nil {
+		return err
+	}
+
+	dstore, err := leveldb.NewDatastore(dataStorePath, nil)
+	if err != nil {
+		return err
+	}
+
 	fmt.Println("Miner-PeerId List:")
+	var count int
 	for k, v := range mIdPeerIdMap {
-		fmt.Printf("%s -> %s\n", k, v)
+		fmt.Printf("Stgorage provider info: %+v\n", v)
+		value, err := json.Marshal(&v)
+		if err != nil {
+			return err
+		}
+		dsKey := datastore.NewKey(k.String())
+		if err = dstore.Put(context.Background(), dsKey, value); err != nil {
+			return err
+		}
+		count++
+	}
+	fmt.Println("Wrote", count, "storage provider records")
+	if err = dstore.Sync(context.Background(), datastore.NewKey("")); err != nil {
+		return fmt.Errorf("cannot sync provider info: %s", err)
 	}
 
 	return err
